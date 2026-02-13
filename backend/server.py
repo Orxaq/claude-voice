@@ -1,11 +1,13 @@
-"""Claude Voice — FastAPI backend with WebSocket streaming."""
+"""Claude Voice — FastAPI backend with WebSocket streaming and multi-provider LLM fallback."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sqlite3
+import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -18,6 +20,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+logger = logging.getLogger("claude-voice")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -30,9 +35,132 @@ DB_PATH = DATA_DIR / "conversations.db"
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-DEFAULT_MODEL = os.getenv("CLAUDE_VOICE_MODEL", "claude-sonnet-4-5-20250929")
 MAX_TOKENS = int(os.getenv("CLAUDE_VOICE_MAX_TOKENS", "1024"))
+
+# ---------------------------------------------------------------------------
+# Provider definitions
+# ---------------------------------------------------------------------------
+
+PROVIDER_CONFIGS: dict[str, dict] = {
+    "anthropic": {
+        "name": "Anthropic",
+        "base_url": "https://api.anthropic.com",
+        "model": os.getenv("CLAUDE_VOICE_MODEL", "claude-sonnet-4-5-20250929"),
+        "api_format": "anthropic",
+        "env_key": "ANTHROPIC_API_KEY",
+    },
+    "openrouter": {
+        "name": "OpenRouter",
+        "base_url": "https://openrouter.ai/api",
+        "model": "anthropic/claude-sonnet-4-5",
+        "api_format": "openai",
+        "env_key": "OPENROUTER_API_KEY",
+    },
+    "openai": {
+        "name": "OpenAI",
+        "base_url": "https://api.openai.com",
+        "model": "gpt-4o",
+        "api_format": "openai",
+        "env_key": "OPENAI_API_KEY",
+    },
+    "groq": {
+        "name": "Groq",
+        "base_url": "https://api.groq.com",
+        "model": "llama-3.3-70b-versatile",
+        "api_format": "openai",
+        "env_key": "GROQ_API_KEY",
+    },
+}
+
+# Fallback order — tried sequentially until one succeeds
+FALLBACK_ORDER: list[str] = ["anthropic", "openrouter", "openai", "groq"]
+
+
+# ---------------------------------------------------------------------------
+# Vault + API key loading
+# ---------------------------------------------------------------------------
+
+
+def _load_vault_env() -> dict:
+    """Load API keys from the encrypted vault."""
+    env: dict[str, str] = {}
+    try:
+        secret_key = subprocess.run(
+            ["security", "find-generic-password", "-s", "com.orxaq.age-key", "-a", "orxaq-secrets", "-w"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if not secret_key:
+            return env
+        vault_path = (
+            Path.home()
+            / "Library"
+            / "Mobile Documents"
+            / "com~apple~CloudDocs"
+            / "orxaq-vault"
+            / "secrets"
+            / "orxaq-ops"
+            / ".env.autonomy.age"
+        )
+        if not vault_path.exists():
+            return env
+        result = subprocess.run(
+            ["age", "-d", "-i", "-", str(vault_path)],
+            input=secret_key, capture_output=True, text=True, timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                line = line.removeprefix("export ").strip()
+                key, _, value = line.partition("=")
+                if key and value:
+                    env[key] = value
+    except Exception:
+        pass
+    return env
+
+
+def _load_api_keys() -> dict[str, str]:
+    """Load API keys from environment variables and the encrypted vault.
+
+    Environment variables take precedence over vault values.
+    Returns a dict mapping provider names to their API keys.
+    """
+    # Start with vault keys (lower priority)
+    vault_env = _load_vault_env()
+
+    keys: dict[str, str] = {}
+    for provider_id, config in PROVIDER_CONFIGS.items():
+        env_key = config["env_key"]
+        # Env vars take priority, then vault
+        value = os.getenv(env_key, "") or vault_env.get(env_key, "")
+        if value:
+            keys[provider_id] = value
+
+    return keys
+
+
+# Module-level state — loaded once at import, refreshable via endpoint
+_api_keys: dict[str, str] = _load_api_keys()
+_active_provider: str | None = None  # None = auto-fallback mode
+
+
+def _get_available_providers() -> list[str]:
+    """Return provider IDs that have API keys, in fallback order."""
+    return [p for p in FALLBACK_ORDER if p in _api_keys]
+
+
+def _resolve_provider() -> str | None:
+    """Return the provider to use: the pinned one if set, otherwise the first available."""
+    if _active_provider and _active_provider in _api_keys:
+        return _active_provider
+    available = _get_available_providers()
+    return available[0] if available else None
+
+
+# Convenience — keep the old module-level variable for backward-compat reads
+ANTHROPIC_API_KEY = _api_keys.get("anthropic", "")
+DEFAULT_MODEL = PROVIDER_CONFIGS["anthropic"]["model"]
+
 
 # ---------------------------------------------------------------------------
 # Database
@@ -127,22 +255,20 @@ def load_tones() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Claude API streaming
+# LLM API streaming — multi-provider with fallback
 # ---------------------------------------------------------------------------
 
 
-async def stream_claude(
+async def _stream_anthropic(
     messages: list[dict],
     system_prompt: str,
-    model: str = DEFAULT_MODEL,
+    api_key: str,
+    model: str,
+    base_url: str,
 ) -> AsyncGenerator[str, None]:
-    """Stream response chunks from Claude API."""
-    if not ANTHROPIC_API_KEY:
-        yield "Error: ANTHROPIC_API_KEY not set. Please set it in your environment."
-        return
-
+    """Stream response chunks from the Anthropic Messages API."""
     headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
+        "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
@@ -158,14 +284,13 @@ async def stream_claude(
     async with httpx.AsyncClient(timeout=120.0) as client:
         async with client.stream(
             "POST",
-            "https://api.anthropic.com/v1/messages",
+            f"{base_url}/v1/messages",
             headers=headers,
             json=body,
         ) as response:
             if response.status_code != 200:
                 error_body = await response.aread()
-                yield f"API error {response.status_code}: {error_body.decode()[:200]}"
-                return
+                raise RuntimeError(f"Anthropic API error {response.status_code}: {error_body.decode()[:200]}")
 
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
@@ -184,6 +309,153 @@ async def stream_claude(
                     continue
 
 
+async def _stream_openai_compat(
+    messages: list[dict],
+    system_prompt: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+) -> AsyncGenerator[str, None]:
+    """Stream response chunks from an OpenAI-compatible chat completions API.
+
+    Works with OpenAI, OpenRouter, and Groq.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "content-type": "application/json",
+    }
+
+    # OpenRouter likes these extra headers for ranking/tracking
+    if "openrouter.ai" in base_url:
+        headers["HTTP-Referer"] = "https://claude-voice.local"
+        headers["X-Title"] = "Claude Voice"
+
+    # Build messages list with system prompt as first message
+    api_messages = [{"role": "system", "content": system_prompt}] + messages
+
+    body = {
+        "model": model,
+        "max_tokens": MAX_TOKENS,
+        "messages": api_messages,
+        "stream": True,
+    }
+
+    # Determine the chat completions endpoint
+    if "openrouter.ai" in base_url:
+        url = f"{base_url}/v1/chat/completions"
+    else:
+        url = f"{base_url}/v1/chat/completions"
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream("POST", url, headers=headers, json=body) as response:
+            if response.status_code != 200:
+                error_body = await response.aread()
+                raise RuntimeError(f"API error {response.status_code}: {error_body.decode()[:200]}")
+
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                    choices = event.get("choices", [])
+                    if choices:
+                        delta = choices[0].get("delta", {})
+                        text = delta.get("content", "")
+                        if text:
+                            yield text
+                except json.JSONDecodeError:
+                    continue
+
+
+async def stream_llm(
+    messages: list[dict],
+    system_prompt: str,
+    model: str | None = None,
+    provider_id: str | None = None,
+) -> AsyncGenerator[str, None]:
+    """Stream LLM response with automatic provider fallback.
+
+    Tries providers in order: anthropic -> openrouter -> openai -> groq.
+    Falls through to the next provider on any error.
+
+    If *provider_id* is given, only that provider is tried (no fallback).
+    """
+    if not _api_keys:
+        yield "Error: No LLM API keys configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, or GROQ_API_KEY."
+        return
+
+    # Build the list of providers to try
+    if provider_id:
+        if provider_id not in _api_keys:
+            yield f"Error: Provider '{provider_id}' has no API key configured."
+            return
+        providers_to_try = [provider_id]
+    elif _active_provider and _active_provider in _api_keys:
+        # Pinned provider first, then fall through to the rest
+        providers_to_try = [_active_provider] + [p for p in FALLBACK_ORDER if p != _active_provider and p in _api_keys]
+    else:
+        providers_to_try = _get_available_providers()
+
+    if not providers_to_try:
+        yield "Error: No LLM providers available."
+        return
+
+    last_error = ""
+    for pid in providers_to_try:
+        config = PROVIDER_CONFIGS[pid]
+        api_key = _api_keys[pid]
+        use_model = model if (model and pid == "anthropic") else config["model"]
+        base_url = config["base_url"]
+
+        try:
+            logger.info(f"Trying provider: {pid} (model={use_model})")
+            if config["api_format"] == "anthropic":
+                streamer = _stream_anthropic(messages, system_prompt, api_key, use_model, base_url)
+            else:
+                streamer = _stream_openai_compat(messages, system_prompt, api_key, use_model, base_url)
+
+            # Buffer a small amount to detect errors before we start yielding
+            first_chunk = None
+            async for chunk in streamer:
+                if first_chunk is None:
+                    first_chunk = chunk
+                    yield chunk
+                else:
+                    yield chunk
+
+            # If we got here without exception, the provider worked
+            if first_chunk is not None:
+                logger.info(f"Provider {pid} succeeded")
+            else:
+                logger.info(f"Provider {pid} returned empty response")
+            return
+
+        except Exception as exc:
+            last_error = f"{pid}: {exc}"
+            logger.warning(f"Provider {pid} failed: {exc}")
+            continue
+
+    # All providers failed
+    yield f"Error: All LLM providers failed. Last error: {last_error}"
+
+
+async def stream_claude(
+    messages: list[dict],
+    system_prompt: str,
+    model: str = DEFAULT_MODEL,
+) -> AsyncGenerator[str, None]:
+    """Stream response chunks from the LLM API — backward-compatible wrapper.
+
+    Maintains the original function signature. Internally delegates to
+    stream_llm() with multi-provider fallback.
+    """
+    async for chunk in stream_llm(messages, system_prompt, model=model):
+        yield chunk
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -192,6 +464,11 @@ async def stream_claude(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    available = _get_available_providers()
+    if available:
+        logger.info(f"LLM providers available: {', '.join(available)}")
+    else:
+        logger.warning("No LLM API keys found — all providers unavailable")
     yield
 
 
@@ -230,7 +507,15 @@ async def service_worker():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "timestamp": _now(), "model": DEFAULT_MODEL}
+    active = _resolve_provider()
+    active_model = PROVIDER_CONFIGS[active]["model"] if active else DEFAULT_MODEL
+    return {
+        "status": "ok",
+        "timestamp": _now(),
+        "model": active_model,
+        "provider": active,
+        "providers_available": _get_available_providers(),
+    }
 
 
 @app.get("/api/personas")
@@ -241,6 +526,70 @@ async def get_personas():
 @app.get("/api/tones")
 async def get_tones():
     return load_tones()
+
+
+@app.get("/api/providers")
+async def get_providers():
+    """Return which LLM providers are available (have API keys)."""
+    available = _get_available_providers()
+    result = {}
+    for pid in FALLBACK_ORDER:
+        config = PROVIDER_CONFIGS[pid]
+        result[pid] = {
+            "name": config["name"],
+            "model": config["model"],
+            "available": pid in available,
+            "active": pid == _active_provider if _active_provider else (pid == available[0] if available else False),
+        }
+    return {
+        "providers": result,
+        "active_provider": _active_provider,
+        "fallback_order": FALLBACK_ORDER,
+        "mode": "pinned" if _active_provider else "auto-fallback",
+    }
+
+
+class ProviderSwitch(BaseModel):
+    provider: str | None = None  # None = reset to auto-fallback mode
+
+
+@app.post("/api/provider")
+async def switch_provider(body: ProviderSwitch):
+    """Switch the active LLM provider.
+
+    Set provider to a specific provider ID to pin it, or null/empty to
+    reset to auto-fallback mode.
+    """
+    global _active_provider
+
+    if body.provider is None or body.provider == "":
+        _active_provider = None
+        return {
+            "mode": "auto-fallback",
+            "active_provider": None,
+            "fallback_order": _get_available_providers(),
+        }
+
+    if body.provider not in PROVIDER_CONFIGS:
+        return JSONResponse(
+            {"error": f"Unknown provider: {body.provider}. Valid: {list(PROVIDER_CONFIGS.keys())}"},
+            status_code=400,
+        )
+
+    if body.provider not in _api_keys:
+        return JSONResponse(
+            {"error": f"Provider '{body.provider}' has no API key configured."},
+            status_code=400,
+        )
+
+    _active_provider = body.provider
+    config = PROVIDER_CONFIGS[_active_provider]
+    return {
+        "mode": "pinned",
+        "active_provider": _active_provider,
+        "name": config["name"],
+        "model": config["model"],
+    }
 
 
 @app.get("/api/conversations")
@@ -510,5 +859,6 @@ async def websocket_chat(ws: WebSocket):
 if __name__ == "__main__":
     import uvicorn
 
+    logging.basicConfig(level=logging.INFO)
     port = int(os.getenv("CLAUDE_VOICE_PORT", "7777"))
     uvicorn.run(app, host="0.0.0.0", port=port)
