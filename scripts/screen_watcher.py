@@ -28,9 +28,17 @@ from pathlib import Path
 
 CHECK_INTERVAL = 2.0      # How often to check screen content (seconds)
 STALE_THRESHOLD = 10.0    # Seconds of no change before intervention
-COOLDOWN = 15.0           # Min seconds between interventions
+COOLDOWN = 30.0           # Min seconds between interventions (was 15)
 MAX_INTERVENTIONS_HOUR = 30  # Safety cap
 ESCALATION_THRESHOLD = 3  # After N soft nudges, escalate to hard nudge
+
+# States that should trigger nudges. "waiting" is excluded because it means
+# Claude asked a question and is legitimately waiting for user input.
+NUDGEABLE_STATES = {"idle", "unknown", "error"}
+
+# Max nudges per window before backing off (give up for BACKOFF_DURATION)
+MAX_NUDGES_PER_WINDOW = 5
+BACKOFF_DURATION = 300.0  # 5 minutes
 
 STATUS_FILE = Path.home() / ".claude" / "watchdogs" / "screen_watcher_status.json"
 LOG_FILE = Path.home() / ".claude" / "watchdogs" / "screen_watcher.log"
@@ -151,7 +159,7 @@ def is_claude_window(content: str) -> bool:
     if not content:
         return False
     # Look for Claude-specific markers in the content
-    markers = ["claude", "Claude", "⏵", "Co-Authored-By", "anthropic",
+    markers = ["claude", "Claude", "\u23f5", "Co-Authored-By", "anthropic",
                "Tool", "Read(", "Write(", "Bash(", "Edit(", "Glob(", "Grep("]
     return any(m in content for m in markers)
 
@@ -173,7 +181,7 @@ def detect_claude_state(content: str) -> str:
     tail_text = "\n".join(tail)
 
     # Actively working: spinner, tool calls, file operations
-    if any(x in tail_text for x in ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]):
+    if any(x in tail_text for x in ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"]):
         return "working"
     if re.search(r"(Reading|Writing|Editing|Running|Searching)", tail_text):
         return "working"
@@ -185,7 +193,7 @@ def detect_claude_state(content: str) -> str:
         return "waiting"
 
     # Claude prompt waiting for input
-    if re.search(r"⏵\s*$", tail_text):
+    if re.search(r"\u23f5\s*$", tail_text):
         return "idle"
     if re.search(r">\s*$", tail_text):
         return "waiting"
@@ -234,6 +242,25 @@ def send_to_all_claude_ttys(text: str) -> int:
     return sent
 
 
+def send_to_single_tty(text: str) -> bool:
+    """Send text to a single Claude TTY (the first one found).
+
+    Used for targeted nudging to avoid spamming all sessions.
+    Falls back to osascript if no TTY found.
+    """
+    ttys = find_claude_ttys()
+    if not ttys:
+        log("No Claude TTYs found for targeted send")
+        return False
+
+    # Send to only the first TTY
+    tty = ttys[0]
+    if send_to_tty(tty, text):
+        log(f"Targeted send to {tty}: {repr(text[:50])}")
+        return True
+    return False
+
+
 # Fallback: osascript keystroke (may fail with permission errors)
 def send_via_osascript(text: str) -> bool:
     """Fallback: send via AppleScript. May fail with error 1002."""
@@ -259,10 +286,12 @@ def send_via_osascript(text: str) -> bool:
 
 
 def nudge(text: str) -> bool:
-    """Send nudge via best available method."""
-    # Try direct TTY write first (most reliable)
-    sent = send_to_all_claude_ttys(text)
-    if sent > 0:
+    """Send nudge via best available method.
+
+    Uses targeted single-TTY send instead of broadcasting to all TTYs.
+    """
+    # Try targeted single TTY write first (avoids spamming healthy sessions)
+    if send_to_single_tty(text):
         return True
 
     # Fallback to osascript
@@ -278,17 +307,26 @@ def watch_loop():
     """Main screen watching loop."""
     log("Screen watcher started")
     log(f"Config: check={CHECK_INTERVAL}s, stale={STALE_THRESHOLD}s, cooldown={COOLDOWN}s")
+    log(f"Nudgeable states: {NUDGEABLE_STATES}")
+    log(f"Max nudges per window before backoff: {MAX_NUDGES_PER_WINDOW} (backoff={BACKOFF_DURATION}s)")
     write_status("starting")
 
     # State tracking per window
     window_hashes: dict[int, str] = {}
     window_last_change: dict[int, float] = {}
+
+    # Per-window nudge tracking to prevent feedback loops
+    # Tracks nudge count per window, and the hash recorded just before nudging
+    window_nudge_count: dict[int, int] = {}        # win_idx -> nudge count
+    window_pre_nudge_hash: dict[int, str] = {}     # win_idx -> hash before nudge
+    window_backoff_until: dict[int, float] = {}     # win_idx -> monotonic time to resume
+
     last_intervention = 0.0
     interventions_this_hour = 0
     hour_start = time.monotonic()
-    soft_nudge_count = 0
     total_interventions = 0
     total_recoveries = 0
+    total_false_positives = 0
 
     while True:
         try:
@@ -319,19 +357,46 @@ def watch_loop():
                     continue
 
                 if h != window_hashes[idx]:
-                    # Content changed — window is alive
-                    window_hashes[idx] = h
-                    window_last_change[idx] = now
-                    soft_nudge_count = 0  # Reset escalation
-                    active_windows.append(idx)
+                    # Content changed — but is it a genuine change or just our nudge echoing?
+                    pre_nudge_h = window_pre_nudge_hash.get(idx)
+                    if pre_nudge_h is not None and pre_nudge_h != h:
+                        # We had a pre-nudge hash recorded. The content changed from
+                        # before-nudge to something new. But we need to check if this
+                        # is genuinely different work or just the nudge echo.
+                        # Clear the pre-nudge hash — we've consumed it.
+                        del window_pre_nudge_hash[idx]
+                        # The nudge itself would have changed content (echo of newline).
+                        # A *genuine* recovery means Claude started producing real output,
+                        # which would change the hash again on the NEXT check cycle.
+                        # For now, just update the hash but do NOT reset nudge count.
+                        # The nudge count only resets on a second consecutive change
+                        # (indicating real work is happening).
+                        window_hashes[idx] = h
+                        window_last_change[idx] = now
+                        active_windows.append(idx)
+                    else:
+                        # No pending pre-nudge hash — this is an organic content change.
+                        # This means genuine work is happening. Reset nudge count.
+                        window_hashes[idx] = h
+                        window_last_change[idx] = now
+                        if idx in window_nudge_count:
+                            window_nudge_count[idx] = 0
+                        active_windows.append(idx)
                 else:
                     # Content unchanged — check how long
                     stale_secs = now - window_last_change.get(idx, now)
                     state = detect_claude_state(content)
 
                     if (stale_secs >= STALE_THRESHOLD
-                        and state not in ("working", "not_claude")):
-                        stale_windows.append((idx, stale_secs, state))
+                        and state in NUDGEABLE_STATES):
+                        # Check if this window is in backoff
+                        if now < window_backoff_until.get(idx, 0):
+                            remaining = window_backoff_until[idx] - now
+                            # Only log occasionally to avoid spam
+                            if int(stale_secs) % 60 == 0:
+                                log(f"win#{idx} in backoff ({remaining:.0f}s remaining), skipping")
+                        else:
+                            stale_windows.append((idx, stale_secs, state))
 
             # Write status
             write_status(
@@ -341,42 +406,77 @@ def watch_loop():
                 stale=len(stale_windows),
                 interventions=total_interventions,
                 recoveries=total_recoveries,
-                soft_nudge_count=soft_nudge_count,
+                false_positives=total_false_positives,
+                backed_off_windows=sum(1 for idx in window_backoff_until
+                                       if now < window_backoff_until[idx]),
             )
 
             # Intervene on stale windows
             if stale_windows and (now - last_intervention) >= COOLDOWN:
                 if interventions_this_hour < MAX_INTERVENTIONS_HOUR:
                     for idx, stale_secs, state in stale_windows:
-                        # Choose nudge level based on escalation
-                        if soft_nudge_count < ESCALATION_THRESHOLD:
+                        nudge_count = window_nudge_count.get(idx, 0)
+
+                        # Check if we've exceeded max nudges for this window
+                        if nudge_count >= MAX_NUDGES_PER_WINDOW:
+                            window_backoff_until[idx] = now + BACKOFF_DURATION
+                            window_nudge_count[idx] = 0  # Reset for after backoff
+                            log(f"win#{idx} hit {MAX_NUDGES_PER_WINDOW} nudges without genuine recovery, "
+                                f"backing off for {BACKOFF_DURATION:.0f}s")
+                            continue
+
+                        # Choose nudge level based on per-window escalation
+                        if nudge_count < ESCALATION_THRESHOLD:
                             msg = SOFT_NUDGE  # Just Enter
                             nudge_type = "soft"
                         else:
-                            msg_idx = min(soft_nudge_count - ESCALATION_THRESHOLD, len(HARD_NUDGES) - 1)
+                            msg_idx = min(nudge_count - ESCALATION_THRESHOLD, len(HARD_NUDGES) - 1)
                             msg = HARD_NUDGES[msg_idx]
                             nudge_type = "hard"
 
-                        log(f"STALE win#{idx} ({stale_secs:.0f}s, state={state}) → {nudge_type} nudge")
+                        log(f"STALE win#{idx} ({stale_secs:.0f}s, state={state}, "
+                            f"nudge_count={nudge_count}) -> {nudge_type} nudge")
+
+                        # Record the hash BEFORE nudging so we can detect false recoveries
+                        window_pre_nudge_hash[idx] = window_hashes.get(idx, "")
 
                         if nudge(msg):
                             total_interventions += 1
                             interventions_this_hour += 1
-                            soft_nudge_count += 1
+                            window_nudge_count[idx] = nudge_count + 1
                             last_intervention = now
                             log(f"Nudge sent ({nudge_type}): {repr(msg[:60])}")
 
-                            # Track recovery: check in 3 seconds if content changed
-                            time.sleep(3)
+                            # Track recovery: check in 5 seconds if content genuinely changed
+                            time.sleep(5)
                             new_windows = get_window_contents()
                             if idx in new_windows:
                                 new_h = content_hash(new_windows[idx])
-                                if new_h != window_hashes.get(idx):
-                                    total_recoveries += 1
-                                    recovery_time = stale_secs + 3
-                                    log(f"RECOVERED in ~{recovery_time:.0f}s")
+                                old_h = window_hashes.get(idx)
+                                pre_h = window_pre_nudge_hash.get(idx)
+
+                                if new_h != old_h:
+                                    # Content changed after nudge. Update hash.
                                     window_hashes[idx] = new_h
                                     window_last_change[idx] = time.monotonic()
+
+                                    # Check the NEW state to see if Claude is actually working now
+                                    new_state = detect_claude_state(new_windows[idx])
+                                    if new_state == "working":
+                                        # Genuine recovery — Claude started working
+                                        total_recoveries += 1
+                                        window_nudge_count[idx] = 0
+                                        if idx in window_pre_nudge_hash:
+                                            del window_pre_nudge_hash[idx]
+                                        recovery_time = stale_secs + 5
+                                        log(f"RECOVERED in ~{recovery_time:.0f}s (state now: {new_state})")
+                                    else:
+                                        # Content changed but Claude not working — likely just nudge echo
+                                        total_false_positives += 1
+                                        log(f"Content changed but state={new_state} (likely nudge echo, "
+                                            f"not genuine recovery). nudge_count={window_nudge_count[idx]}")
+                                else:
+                                    log(f"No content change after nudge for win#{idx}")
                         break  # One nudge per cycle
 
             time.sleep(CHECK_INTERVAL)
@@ -447,23 +547,27 @@ def simulate_test():
     print("\n6. Stale detection simulation...")
     print(f"   CHECK_INTERVAL = {CHECK_INTERVAL}s")
     print(f"   STALE_THRESHOLD = {STALE_THRESHOLD}s")
+    print(f"   COOLDOWN = {COOLDOWN}s")
+    print(f"   NUDGEABLE_STATES = {NUDGEABLE_STATES}")
+    print(f"   MAX_NUDGES_PER_WINDOW = {MAX_NUDGES_PER_WINDOW}")
+    print(f"   BACKOFF_DURATION = {BACKOFF_DURATION}s")
     print(f"   Min detection time = {STALE_THRESHOLD}s (if content stops immediately after check)")
     print(f"   Max detection time = {STALE_THRESHOLD + CHECK_INTERVAL}s (worst case alignment)")
-    print(f"   Recovery check = +3s after nudge")
-    print(f"   Total worst-case recovery = {STALE_THRESHOLD + CHECK_INTERVAL + 3}s")
+    print(f"   Recovery check = +5s after nudge")
+    print(f"   Total worst-case recovery = {STALE_THRESHOLD + CHECK_INTERVAL + 5}s")
 
     # 7. Minimum possible recovery time calculation
     print("\n7. Minimum recovery time analysis:")
     for interval in [0.5, 1.0, 2.0, 3.0, 5.0]:
         for threshold in [3, 5, 8, 10, 15]:
-            worst = threshold + interval + 3
-            best = threshold + 3
+            worst = threshold + interval + 5
+            best = threshold + 5
             if interval <= 2.0 and threshold <= 10:
-                print(f"   interval={interval}s, threshold={threshold}s → best={best}s, worst={worst}s")
+                print(f"   interval={interval}s, threshold={threshold}s -> best={best}s, worst={worst}s")
 
     print()
-    print("Recommendation: interval=1s, threshold=5s → 8-9s recovery")
-    print("Aggressive:     interval=0.5s, threshold=3s → 6-6.5s recovery")
+    print("Recommendation: interval=1s, threshold=5s -> 10-11s recovery")
+    print("Aggressive:     interval=0.5s, threshold=3s -> 8-8.5s recovery")
 
 
 if __name__ == "__main__":
