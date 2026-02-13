@@ -1,0 +1,1046 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#0a0a1a">
+    <title>Claude Voice</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/icon-180.png">
+    <style>
+        :root {
+            --bg: #0a0a1a;
+            --surface: #141428;
+            --surface-2: #1e1e3a;
+            --accent: #6366f1;
+            --accent-glow: rgba(99, 102, 241, 0.3);
+            --text: #e8e8f0;
+            --text-dim: #8888a8;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --radius: 16px;
+        }
+
+        [data-theme="warm"] {
+            --bg: #1a1008;
+            --surface: #2a1c10;
+            --surface-2: #3a2818;
+            --accent: #f59e0b;
+            --accent-glow: rgba(245, 158, 11, 0.3);
+            --text: #f0e8d8;
+            --text-dim: #a89878;
+        }
+
+        [data-theme="ocean"] {
+            --bg: #0a1a2a;
+            --surface: #102030;
+            --surface-2: #183040;
+            --accent: #06b6d4;
+            --accent-glow: rgba(6, 182, 212, 0.3);
+            --text: #d8f0f8;
+            --text-dim: #6898a8;
+        }
+
+        [data-theme="forest"] {
+            --bg: #0a1a0a;
+            --surface: #102810;
+            --surface-2: #183818;
+            --accent: #22c55e;
+            --accent-glow: rgba(34, 197, 94, 0.3);
+            --text: #d8f0d8;
+            --text-dim: #68a868;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            height: 100dvh;
+            overflow: hidden;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .app {
+            display: flex;
+            flex-direction: column;
+            height: 100dvh;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        /* --- Header --- */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            padding-top: max(12px, env(safe-area-inset-top));
+            background: var(--surface);
+            border-bottom: 1px solid var(--surface-2);
+        }
+
+        .header h1 {
+            font-size: 18px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .header .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        .header .status-dot.offline { background: var(--warning); animation: none; }
+        .header .status-dot.error { background: var(--danger); animation: none; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .icon-btn {
+            background: var(--surface-2);
+            border: none;
+            color: var(--text-dim);
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            font-size: 18px;
+            transition: all 0.2s;
+        }
+
+        .icon-btn:active { transform: scale(0.9); background: var(--accent); color: white; }
+
+        /* --- Messages area --- */
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            scroll-behavior: smooth;
+        }
+
+        .msg {
+            max-width: 85%;
+            padding: 12px 16px;
+            border-radius: var(--radius);
+            font-size: 15px;
+            line-height: 1.5;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; } }
+
+        .msg.user {
+            align-self: flex-end;
+            background: var(--accent);
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+
+        .msg.assistant {
+            align-self: flex-start;
+            background: var(--surface-2);
+            border-bottom-left-radius: 4px;
+        }
+
+        .msg.system {
+            align-self: center;
+            background: transparent;
+            color: var(--text-dim);
+            font-size: 13px;
+            text-align: center;
+        }
+
+        .msg .speaking-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            margin-left: 6px;
+            vertical-align: middle;
+        }
+
+        .typing-indicator {
+            display: flex;
+            gap: 4px;
+            padding: 8px 16px;
+        }
+
+        .typing-indicator span {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--text-dim);
+            animation: bounce 1.4s infinite;
+        }
+
+        .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes bounce {
+            0%, 80%, 100% { transform: translateY(0); }
+            40% { transform: translateY(-6px); }
+        }
+
+        /* --- Voice button area --- */
+        .voice-area {
+            padding: 16px;
+            padding-bottom: max(16px, env(safe-area-inset-bottom));
+            background: var(--surface);
+            border-top: 1px solid var(--surface-2);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .voice-btn {
+            width: 72px;
+            height: 72px;
+            border-radius: 50%;
+            border: 3px solid var(--accent);
+            background: var(--surface-2);
+            color: var(--accent);
+            font-size: 28px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s;
+            position: relative;
+        }
+
+        .voice-btn:active { transform: scale(0.9); }
+
+        .voice-btn.listening {
+            background: var(--accent);
+            color: white;
+            box-shadow: 0 0 0 8px var(--accent-glow);
+            animation: listening-pulse 1.5s infinite;
+        }
+
+        @keyframes listening-pulse {
+            0%, 100% { box-shadow: 0 0 0 8px var(--accent-glow); }
+            50% { box-shadow: 0 0 0 16px transparent; }
+        }
+
+        .voice-btn.speaking {
+            border-color: var(--success);
+            color: var(--success);
+        }
+
+        .voice-hint {
+            font-size: 13px;
+            color: var(--text-dim);
+        }
+
+        .voice-controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            width: 100%;
+            justify-content: center;
+        }
+
+        .voice-controls button {
+            background: var(--surface-2);
+            border: none;
+            color: var(--text-dim);
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .voice-controls button:active { background: var(--accent); color: white; }
+        .voice-controls button.active { background: var(--accent); color: white; }
+
+        /* --- Settings panel --- */
+        .settings-panel {
+            position: fixed;
+            inset: 0;
+            background: var(--bg);
+            z-index: 100;
+            transform: translateY(100%);
+            transition: transform 0.3s ease;
+            overflow-y: auto;
+            padding: 16px;
+            padding-top: max(16px, env(safe-area-inset-top));
+        }
+
+        .settings-panel.open { transform: translateY(0); }
+
+        .settings-panel h2 {
+            font-size: 20px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .settings-group {
+            margin-bottom: 20px;
+        }
+
+        .settings-group label {
+            display: block;
+            font-size: 13px;
+            color: var(--text-dim);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .settings-options {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .settings-options button {
+            background: var(--surface-2);
+            border: 2px solid transparent;
+            color: var(--text);
+            padding: 10px 16px;
+            border-radius: 12px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .settings-options button.selected {
+            border-color: var(--accent);
+            background: var(--accent);
+            color: white;
+        }
+
+        /* --- Offline banner --- */
+        .offline-banner {
+            background: var(--warning);
+            color: #000;
+            text-align: center;
+            padding: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            display: none;
+        }
+
+        .offline-banner.show { display: block; }
+
+        /* --- Text input fallback --- */
+        .text-input-area {
+            display: none;
+            width: 100%;
+            gap: 8px;
+        }
+
+        .text-input-area.show { display: flex; }
+
+        .text-input-area input {
+            flex: 1;
+            background: var(--surface-2);
+            border: 1px solid var(--accent);
+            color: var(--text);
+            padding: 10px 14px;
+            border-radius: 20px;
+            font-size: 15px;
+            outline: none;
+        }
+
+        .text-input-area button {
+            background: var(--accent);
+            border: none;
+            color: white;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            font-size: 18px;
+            cursor: pointer;
+        }
+
+        /* --- Waveform visualizer --- */
+        .waveform {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 3px;
+            height: 24px;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .waveform.active { opacity: 1; }
+
+        .waveform .bar {
+            width: 3px;
+            height: 4px;
+            background: var(--accent);
+            border-radius: 2px;
+            transition: height 0.1s;
+        }
+    </style>
+</head>
+<body data-theme="default">
+    <div class="app">
+        <div class="offline-banner" id="offlineBanner">Offline — messages will be sent when reconnected</div>
+
+        <div class="header">
+            <h1>
+                <span class="status-dot" id="statusDot"></span>
+                <span id="personaName">Claude Voice</span>
+            </h1>
+            <div class="header-actions">
+                <button class="icon-btn" id="btnHistory" title="History">&#x1f4ac;</button>
+                <button class="icon-btn" id="btnSettings" title="Settings">&#x2699;</button>
+            </div>
+        </div>
+
+        <div class="messages" id="messages">
+            <div class="msg system">Tap the microphone to start talking</div>
+        </div>
+
+        <div class="voice-area">
+            <div class="waveform" id="waveform"></div>
+            <button class="voice-btn" id="voiceBtn">&#x1f3a4;</button>
+            <span class="voice-hint" id="voiceHint">Tap to speak</span>
+            <div class="voice-controls">
+                <button id="btnMute" title="Mute TTS">&#x1f50a; Voice On</button>
+                <button id="btnKeyboard" title="Type instead">&#x2328; Type</button>
+                <button id="btnStop" title="Stop speaking">&#x23f9; Stop</button>
+            </div>
+            <div class="text-input-area" id="textInput">
+                <input type="text" id="textField" placeholder="Type a message..." autocomplete="off">
+                <button id="textSend">&#x27a4;</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Panel -->
+    <div class="settings-panel" id="settingsPanel">
+        <h2>
+            Settings
+            <button class="icon-btn" id="btnCloseSettings">&#x2715;</button>
+        </h2>
+
+        <div class="settings-group">
+            <label>Persona</label>
+            <div class="settings-options" id="personaOptions"></div>
+        </div>
+
+        <div class="settings-group">
+            <label>Tone</label>
+            <div class="settings-options" id="toneOptions"></div>
+        </div>
+
+        <div class="settings-group">
+            <label>Theme</label>
+            <div class="settings-options" id="themeOptions">
+                <button data-theme="default" class="selected">Midnight</button>
+                <button data-theme="warm">Campfire</button>
+                <button data-theme="ocean">Ocean</button>
+                <button data-theme="forest">Forest</button>
+            </div>
+        </div>
+
+        <div class="settings-group">
+            <label>Voice Speed</label>
+            <div class="settings-options">
+                <button data-speed="0.8">Slow</button>
+                <button data-speed="1" class="selected">Normal</button>
+                <button data-speed="1.3">Fast</button>
+            </div>
+        </div>
+
+        <div class="settings-group">
+            <label>Auto-listen after response</label>
+            <div class="settings-options">
+                <button data-autolistn="true" class="selected">On</button>
+                <button data-autolistn="false">Off</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    // -----------------------------------------------------------------------
+    // State
+    // -----------------------------------------------------------------------
+    const state = {
+        ws: null,
+        conversationId: null,
+        persona: 'default',
+        tone: 'balanced',
+        theme: 'default',
+        voiceSpeed: 1,
+        autoListen: true,
+        muted: false,
+        isListening: false,
+        isSpeaking: false,
+        isProcessing: false,
+        online: navigator.onLine,
+        recognition: null,
+        synthesis: window.speechSynthesis,
+        personas: {},
+        tones: {},
+        voiceConfig: { voice: 'Samantha', speed: 180 },
+        offlineQueue: [],
+        reconnectAttempt: 0,
+        maxReconnect: 10,
+    };
+
+    // -----------------------------------------------------------------------
+    // DOM
+    // -----------------------------------------------------------------------
+    const $ = (s) => document.querySelector(s);
+    const messagesEl = $('#messages');
+    const voiceBtn = $('#voiceBtn');
+    const voiceHint = $('#voiceHint');
+    const statusDot = $('#statusDot');
+    const offlineBanner = $('#offlineBanner');
+    const waveformEl = $('#waveform');
+    const personaNameEl = $('#personaName');
+
+    // Create waveform bars
+    for (let i = 0; i < 12; i++) {
+        const bar = document.createElement('div');
+        bar.className = 'bar';
+        waveformEl.appendChild(bar);
+    }
+
+    // -----------------------------------------------------------------------
+    // Speech Recognition (STT)
+    // -----------------------------------------------------------------------
+    function initSpeechRecognition() {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            addMessage('system', 'Speech recognition not available — use the keyboard instead');
+            $('#btnKeyboard').click();
+            return;
+        }
+
+        state.recognition = new SpeechRecognition();
+        state.recognition.continuous = false;
+        state.recognition.interimResults = true;
+        state.recognition.lang = 'en-US';
+        state.recognition.maxAlternatives = 1;
+
+        state.recognition.onresult = (event) => {
+            const transcript = Array.from(event.results)
+                .map(r => r[0].transcript)
+                .join('');
+
+            if (event.results[event.results.length - 1].isFinal) {
+                stopListening();
+                if (transcript.trim()) {
+                    sendMessage(transcript.trim());
+                }
+            } else {
+                voiceHint.textContent = transcript || 'Listening...';
+            }
+        };
+
+        state.recognition.onerror = (event) => {
+            if (event.error === 'no-speech') {
+                voiceHint.textContent = 'No speech detected — tap again';
+            } else if (event.error === 'network') {
+                voiceHint.textContent = 'Network issue — try again';
+            }
+            stopListening();
+        };
+
+        state.recognition.onend = () => {
+            if (state.isListening) stopListening();
+        };
+    }
+
+    function startListening() {
+        if (state.isSpeaking) {
+            state.synthesis.cancel();
+            state.isSpeaking = false;
+        }
+        if (state.isProcessing) return;
+
+        state.isListening = true;
+        voiceBtn.classList.add('listening');
+        voiceHint.textContent = 'Listening...';
+        waveformEl.classList.add('active');
+
+        try {
+            state.recognition.start();
+        } catch (e) {
+            // already started
+        }
+
+        // Animate waveform
+        animateWaveform();
+    }
+
+    function stopListening() {
+        state.isListening = false;
+        voiceBtn.classList.remove('listening');
+        waveformEl.classList.remove('active');
+
+        try {
+            state.recognition.stop();
+        } catch (e) {}
+    }
+
+    let waveformInterval;
+    function animateWaveform() {
+        clearInterval(waveformInterval);
+        const bars = waveformEl.querySelectorAll('.bar');
+        waveformInterval = setInterval(() => {
+            if (!state.isListening && !state.isSpeaking) {
+                clearInterval(waveformInterval);
+                bars.forEach(b => b.style.height = '4px');
+                return;
+            }
+            bars.forEach(bar => {
+                bar.style.height = `${4 + Math.random() * 20}px`;
+            });
+        }, 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Speech Synthesis (TTS)
+    // -----------------------------------------------------------------------
+    function speak(text, voiceName, speed) {
+        if (state.muted || !text) return Promise.resolve();
+
+        return new Promise((resolve) => {
+            const utterance = new SpeechSynthesisUtterance(text);
+
+            // Find the matching voice
+            const voices = state.synthesis.getVoices();
+            const match = voices.find(v => v.name === voiceName) ||
+                          voices.find(v => v.name.includes('Samantha')) ||
+                          voices.find(v => v.lang.startsWith('en'));
+            if (match) utterance.voice = match;
+
+            utterance.rate = state.voiceSpeed;
+            utterance.pitch = 1;
+            utterance.volume = 1;
+
+            state.isSpeaking = true;
+            voiceBtn.classList.add('speaking');
+            waveformEl.classList.add('active');
+            animateWaveform();
+
+            utterance.onend = () => {
+                state.isSpeaking = false;
+                voiceBtn.classList.remove('speaking');
+                waveformEl.classList.remove('active');
+                resolve();
+
+                // Auto-listen after response
+                if (state.autoListen && !state.muted) {
+                    setTimeout(() => startListening(), 500);
+                }
+            };
+
+            utterance.onerror = () => {
+                state.isSpeaking = false;
+                voiceBtn.classList.remove('speaking');
+                resolve();
+            };
+
+            state.synthesis.speak(utterance);
+        });
+    }
+
+    // Load voices (they load asynchronously)
+    if (state.synthesis) {
+        state.synthesis.getVoices();
+        state.synthesis.onvoiceschanged = () => state.synthesis.getVoices();
+    }
+
+    // -----------------------------------------------------------------------
+    // WebSocket connection
+    // -----------------------------------------------------------------------
+    function connectWS() {
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${location.host}/ws/chat`;
+
+        try {
+            state.ws = new WebSocket(wsUrl);
+        } catch (e) {
+            setStatus('error');
+            scheduleReconnect();
+            return;
+        }
+
+        state.ws.onopen = () => {
+            setStatus('online');
+            state.reconnectAttempt = 0;
+
+            // Init conversation
+            state.ws.send(JSON.stringify({
+                type: 'init',
+                conversation_id: state.conversationId,
+                persona: state.persona,
+                tone: state.tone,
+            }));
+
+            // Flush offline queue
+            flushQueue();
+        };
+
+        let streamBuffer = '';
+
+        state.ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+
+            switch (msg.type) {
+                case 'init_ack':
+                    state.conversationId = msg.conversation_id;
+                    localStorage.setItem('cv_conv_id', msg.conversation_id);
+                    break;
+
+                case 'response_start':
+                    state.isProcessing = true;
+                    streamBuffer = '';
+                    addMessage('assistant', '', true);
+                    voiceHint.textContent = 'Thinking...';
+                    break;
+
+                case 'chunk':
+                    streamBuffer += msg.text;
+                    updateStreamingMessage(streamBuffer);
+                    break;
+
+                case 'response_end':
+                    state.isProcessing = false;
+                    state.voiceConfig = { voice: msg.voice, speed: msg.speed };
+                    voiceHint.textContent = 'Tap to speak';
+                    speak(msg.full_text, msg.voice, msg.speed);
+                    break;
+
+                case 'error':
+                    addMessage('system', `Error: ${msg.message}`);
+                    state.isProcessing = false;
+                    voiceHint.textContent = 'Tap to speak';
+                    break;
+
+                case 'pong':
+                    break;
+            }
+        };
+
+        state.ws.onclose = () => {
+            setStatus('offline');
+            scheduleReconnect();
+        };
+
+        state.ws.onerror = () => {
+            setStatus('error');
+        };
+    }
+
+    function scheduleReconnect() {
+        if (state.reconnectAttempt >= state.maxReconnect) return;
+        const delay = Math.min(1000 * Math.pow(2, state.reconnectAttempt), 30000);
+        state.reconnectAttempt++;
+        setTimeout(connectWS, delay);
+    }
+
+    function setStatus(s) {
+        statusDot.className = 'status-dot';
+        if (s === 'offline') statusDot.classList.add('offline');
+        else if (s === 'error') statusDot.classList.add('error');
+        state.online = s === 'online';
+        offlineBanner.classList.toggle('show', !state.online);
+    }
+
+    // -----------------------------------------------------------------------
+    // Messages
+    // -----------------------------------------------------------------------
+    let streamingMsgEl = null;
+
+    function addMessage(role, text, streaming = false) {
+        const div = document.createElement('div');
+        div.className = `msg ${role}`;
+        div.textContent = text;
+        messagesEl.appendChild(div);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+
+        if (streaming) {
+            streamingMsgEl = div;
+            // Add typing indicator
+            const typing = document.createElement('div');
+            typing.className = 'typing-indicator';
+            typing.innerHTML = '<span></span><span></span><span></span>';
+            div.appendChild(typing);
+        }
+
+        return div;
+    }
+
+    function updateStreamingMessage(text) {
+        if (streamingMsgEl) {
+            streamingMsgEl.textContent = text;
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+    }
+
+    function sendMessage(text) {
+        addMessage('user', text);
+        voiceHint.textContent = 'Sending...';
+
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+            state.ws.send(JSON.stringify({
+                type: 'message',
+                content: text,
+            }));
+        } else {
+            // Queue for later
+            state.offlineQueue.push({
+                conversation_id: state.conversationId,
+                content: text,
+                created_at: new Date().toISOString(),
+            });
+            localStorage.setItem('cv_queue', JSON.stringify(state.offlineQueue));
+            addMessage('system', 'Queued — will send when reconnected');
+            voiceHint.textContent = 'Offline — tap to speak';
+        }
+    }
+
+    function flushQueue() {
+        const queue = JSON.parse(localStorage.getItem('cv_queue') || '[]');
+        for (const msg of queue) {
+            if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                state.ws.send(JSON.stringify({
+                    type: 'message',
+                    content: msg.content,
+                }));
+            }
+        }
+        localStorage.removeItem('cv_queue');
+        state.offlineQueue = [];
+    }
+
+    // -----------------------------------------------------------------------
+    // Settings
+    // -----------------------------------------------------------------------
+    async function loadConfig() {
+        try {
+            const [personas, tones] = await Promise.all([
+                fetch('/api/personas').then(r => r.json()),
+                fetch('/api/tones').then(r => r.json()),
+            ]);
+            state.personas = personas;
+            state.tones = tones;
+            renderPersonaOptions();
+            renderToneOptions();
+        } catch (e) {
+            // Use defaults
+        }
+    }
+
+    function renderPersonaOptions() {
+        const container = $('#personaOptions');
+        container.innerHTML = '';
+        for (const [key, p] of Object.entries(state.personas)) {
+            const btn = document.createElement('button');
+            btn.textContent = p.name;
+            btn.dataset.persona = key;
+            if (key === state.persona) btn.classList.add('selected');
+            btn.onclick = () => {
+                container.querySelectorAll('button').forEach(b => b.classList.remove('selected'));
+                btn.classList.add('selected');
+                state.persona = key;
+                state.voiceConfig = { voice: p.voice, speed: p.speed };
+                personaNameEl.textContent = p.name;
+                localStorage.setItem('cv_persona', key);
+                if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                    state.ws.send(JSON.stringify({ type: 'config', persona: key, tone: state.tone }));
+                }
+            };
+            container.appendChild(btn);
+        }
+    }
+
+    function renderToneOptions() {
+        const container = $('#toneOptions');
+        container.innerHTML = '';
+        for (const [key, desc] of Object.entries(state.tones)) {
+            const btn = document.createElement('button');
+            btn.textContent = key.charAt(0).toUpperCase() + key.slice(1);
+            btn.title = desc;
+            btn.dataset.tone = key;
+            if (key === state.tone) btn.classList.add('selected');
+            btn.onclick = () => {
+                container.querySelectorAll('button').forEach(b => b.classList.remove('selected'));
+                btn.classList.add('selected');
+                state.tone = key;
+                localStorage.setItem('cv_tone', key);
+                if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                    state.ws.send(JSON.stringify({ type: 'config', persona: state.persona, tone: key }));
+                }
+            };
+            container.appendChild(btn);
+        }
+    }
+
+    // Theme switcher
+    $('#themeOptions').addEventListener('click', (e) => {
+        const btn = e.target.closest('button');
+        if (!btn || !btn.dataset.theme) return;
+        document.body.dataset.theme = btn.dataset.theme;
+        state.theme = btn.dataset.theme;
+        localStorage.setItem('cv_theme', btn.dataset.theme);
+        $('#themeOptions').querySelectorAll('button').forEach(b => b.classList.remove('selected'));
+        btn.classList.add('selected');
+    });
+
+    // Speed selector
+    document.querySelectorAll('[data-speed]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('[data-speed]').forEach(b => b.classList.remove('selected'));
+            btn.classList.add('selected');
+            state.voiceSpeed = parseFloat(btn.dataset.speed);
+            localStorage.setItem('cv_speed', btn.dataset.speed);
+        });
+    });
+
+    // Auto-listen toggle
+    document.querySelectorAll('[data-autolistn]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('[data-autolistn]').forEach(b => b.classList.remove('selected'));
+            btn.classList.add('selected');
+            state.autoListen = btn.dataset.autolistn === 'true';
+            localStorage.setItem('cv_autolisten', state.autoListen);
+        });
+    });
+
+    // -----------------------------------------------------------------------
+    // Event handlers
+    // -----------------------------------------------------------------------
+    voiceBtn.addEventListener('click', () => {
+        if (state.isListening) {
+            stopListening();
+        } else {
+            startListening();
+        }
+    });
+
+    $('#btnMute').addEventListener('click', function() {
+        state.muted = !state.muted;
+        this.textContent = state.muted ? '&#x1f507; Voice Off' : '&#x1f50a; Voice On';
+        this.innerHTML = state.muted ? '&#x1f507; Voice Off' : '&#x1f50a; Voice On';
+        this.classList.toggle('active', state.muted);
+        if (state.muted && state.isSpeaking) {
+            state.synthesis.cancel();
+            state.isSpeaking = false;
+        }
+    });
+
+    $('#btnKeyboard').addEventListener('click', function() {
+        const textArea = $('#textInput');
+        textArea.classList.toggle('show');
+        this.classList.toggle('active');
+        if (textArea.classList.contains('show')) {
+            $('#textField').focus();
+        }
+    });
+
+    $('#btnStop').addEventListener('click', () => {
+        if (state.isSpeaking) {
+            state.synthesis.cancel();
+            state.isSpeaking = false;
+            voiceBtn.classList.remove('speaking');
+            waveformEl.classList.remove('active');
+        }
+    });
+
+    $('#textSend').addEventListener('click', () => {
+        const field = $('#textField');
+        const text = field.value.trim();
+        if (text) {
+            sendMessage(text);
+            field.value = '';
+        }
+    });
+
+    $('#textField').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            $('#textSend').click();
+        }
+    });
+
+    $('#btnSettings').addEventListener('click', () => {
+        $('#settingsPanel').classList.add('open');
+    });
+
+    $('#btnCloseSettings').addEventListener('click', () => {
+        $('#settingsPanel').classList.remove('open');
+    });
+
+    // Online/offline detection
+    window.addEventListener('online', () => {
+        setStatus('online');
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+            connectWS();
+        }
+    });
+
+    window.addEventListener('offline', () => {
+        setStatus('offline');
+    });
+
+    // Keep-alive ping
+    setInterval(() => {
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+            state.ws.send(JSON.stringify({ type: 'ping' }));
+        }
+    }, 30000);
+
+    // -----------------------------------------------------------------------
+    // Init
+    // -----------------------------------------------------------------------
+    function init() {
+        // Restore state from localStorage
+        state.persona = localStorage.getItem('cv_persona') || 'default';
+        state.tone = localStorage.getItem('cv_tone') || 'balanced';
+        state.theme = localStorage.getItem('cv_theme') || 'default';
+        state.voiceSpeed = parseFloat(localStorage.getItem('cv_speed') || '1');
+        state.autoListen = localStorage.getItem('cv_autolisten') !== 'false';
+        state.conversationId = localStorage.getItem('cv_conv_id') || null;
+
+        document.body.dataset.theme = state.theme;
+
+        initSpeechRecognition();
+        loadConfig();
+        connectWS();
+
+        // Register service worker
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js').catch(() => {});
+        }
+    }
+
+    init();
+    </script>
+</body>
+</html>

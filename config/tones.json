@@ -1,0 +1,7 @@
+{
+    "concise": "Respond in 1-2 sentences max. Be direct and to the point.",
+    "balanced": "Respond naturally in 2-4 sentences. Mix information with warmth.",
+    "detailed": "Give thorough responses with context and explanation. 4-6 sentences is fine.",
+    "casual": "Be relaxed and informal, like chatting with a friend on a road trip.",
+    "professional": "Be precise and professional. Stick to facts and numbers."
+}
