@@ -1,0 +1,29 @@
+#!/bin/bash
+# voice — instant switch to voice conversation mode
+# Usage: voice [persona]
+#   voice          → copilot (default)
+#   voice coder    → pair programming partner
+#   voice exec     → executive briefer
+#   voice narrator → storyteller
+
+set -euo pipefail
+
+# Resolve symlinks to find the real script directory
+REAL_PATH="$(readlink -f "$0" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$REAL_PATH")" && pwd)"
+# Pass-through flags like --help directly
+if [[ "${1:-}" == --* ]]; then
+    exec python3 "$SCRIPT_DIR/voice_loop.py" "$@"
+fi
+
+PERSONA="${1:-copilot}"
+
+# Map short names
+case "$PERSONA" in
+    exec|executive|brief) PERSONA="executive" ;;
+    code|dev|pair) PERSONA="coder" ;;
+    story|narrate) PERSONA="narrator" ;;
+    default|claude) PERSONA="default" ;;
+esac
+
+exec python3 "$SCRIPT_DIR/voice_loop.py" --persona "$PERSONA" "${@:2}"
