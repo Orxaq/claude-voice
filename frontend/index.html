@@ -813,7 +813,40 @@
                 content: text,
             }));
         } else {
-            // Queue for later
+            // WebSocket down — try HTTP fallback
+            sendViaHTTP(text);
+        }
+    }
+
+    async function sendViaHTTP(text) {
+        voiceHint.textContent = 'Sending (HTTP)...';
+        state.isProcessing = true;
+
+        try {
+            const resp = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    content: text,
+                    conversation_id: state.conversationId,
+                    persona: state.persona,
+                    tone: state.tone,
+                }),
+            });
+
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+            const data = await resp.json();
+            state.conversationId = data.conversation_id;
+            localStorage.setItem('cv_conv_id', data.conversation_id);
+
+            addMessage('assistant', data.content);
+            state.isProcessing = false;
+            voiceHint.textContent = 'Tap to speak';
+
+            speak(data.content, data.voice, data.speed);
+        } catch (e) {
+            // Truly offline — queue for later
             state.offlineQueue.push({
                 conversation_id: state.conversationId,
                 content: text,
@@ -821,6 +854,7 @@
             });
             localStorage.setItem('cv_queue', JSON.stringify(state.offlineQueue));
             addMessage('system', 'Queued — will send when reconnected');
+            state.isProcessing = false;
             voiceHint.textContent = 'Offline — tap to speak';
         }
     }

@@ -294,6 +294,76 @@ async def queue_message(body: dict):
     return {"queued": True, "id": msg_id}
 
 
+@app.post("/api/chat")
+async def http_chat(body: dict):
+    """HTTP fallback for when WebSocket can't establish (spotty connections)."""
+    user_text = body.get("content", "").strip()
+    conv_id = body.get("conversation_id")
+    persona_key = body.get("persona", "default")
+    tone_key = body.get("tone", "balanced")
+
+    if not user_text:
+        return JSONResponse({"error": "empty message"}, status_code=400)
+
+    # Create conversation if needed
+    conn = sqlite3.connect(str(DB_PATH))
+    if not conv_id:
+        conv_id = str(uuid.uuid4())
+        now = _now()
+        conn.execute(
+            "INSERT INTO conversations (id, title, created_at, updated_at, persona, tone) VALUES (?, ?, ?, ?, ?, ?)",
+            (conv_id, user_text[:50], now, now, persona_key, tone_key),
+        )
+        conn.commit()
+
+    # Save user message
+    conn.execute(
+        "INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        (str(uuid.uuid4()), conv_id, "user", user_text, _now()),
+    )
+    conn.commit()
+
+    # Load history
+    conn.row_factory = sqlite3.Row
+    history_rows = conn.execute(
+        "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at ASC",
+        (conv_id,),
+    ).fetchall()
+    conn.close()
+
+    api_messages = [{"role": r["role"], "content": r["content"]} for r in history_rows]
+
+    personas = load_personas()
+    tones = load_tones()
+    persona = personas.get(persona_key, personas["default"])
+    tone_instruction = tones.get(tone_key, tones["balanced"])
+    system_prompt = f"{persona['system_prompt']}\n\nTone: {tone_instruction}"
+
+    # Collect full response
+    full_response = []
+    async for chunk in stream_claude(api_messages, system_prompt):
+        full_response.append(chunk)
+
+    response_text = "".join(full_response)
+
+    # Save assistant message
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute(
+        "INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        (str(uuid.uuid4()), conv_id, "assistant", response_text, _now()),
+    )
+    conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), conv_id))
+    conn.commit()
+    conn.close()
+
+    return {
+        "conversation_id": conv_id,
+        "content": response_text,
+        "voice": persona.get("voice", "Samantha"),
+        "speed": persona.get("speed", 180),
+    }
+
+
 # ---------------------------------------------------------------------------
 # WebSocket for real-time voice chat
 # ---------------------------------------------------------------------------

@@ -142,6 +142,32 @@ class TestOfflineQueue:
         assert "id" in data
 
 
+class TestHTTPChat:
+    def test_chat_empty_message(self, client):
+        resp = client.post("/api/chat", json={"content": ""})
+        assert resp.status_code == 400
+
+    def test_chat_creates_conversation(self, client):
+        # This will fail at Claude API (no key) but should create conversation
+        resp = client.post("/api/chat", json={
+            "content": "hello",
+            "persona": "default",
+            "tone": "concise",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "conversation_id" in data
+        assert "content" in data
+
+    def test_chat_with_existing_conversation(self, client):
+        conv = client.post("/api/conversations").json()
+        resp = client.post("/api/chat", json={
+            "content": "hello",
+            "conversation_id": conv["id"],
+        })
+        assert resp.status_code == 200
+
+
 class TestFrontend:
     def test_serve_index(self, client):
         resp = client.get("/")
