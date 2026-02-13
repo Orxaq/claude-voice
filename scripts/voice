@@ -1,6 +1,10 @@
 #!/bin/bash
 # voice — instant switch to voice conversation mode
-# Usage: voice [persona]
+#
+# When run from inside Claude Code (non-interactive), opens a NEW Terminal
+# window so audio I/O works. When run from a normal terminal, runs inline.
+#
+# Usage:
 #   voice          → copilot (default)
 #   voice coder    → pair programming partner
 #   voice exec     → executive briefer
@@ -11,7 +15,8 @@ set -euo pipefail
 # Resolve symlinks to find the real script directory
 REAL_PATH="$(readlink -f "$0" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$REAL_PATH")" && pwd)"
-# Pass-through flags like --help directly
+
+# Pass-through flags like --help, --test directly
 if [[ "${1:-}" == --* ]]; then
     exec python3 "$SCRIPT_DIR/voice_loop.py" "$@"
 fi
@@ -26,4 +31,21 @@ case "$PERSONA" in
     default|claude) PERSONA="default" ;;
 esac
 
-exec python3 "$SCRIPT_DIR/voice_loop.py" --persona "$PERSONA" "${@:2}"
+EXTRA_ARGS="${@:2}"
+
+# Detect if we're inside Claude Code's bash tool (non-interactive tty)
+# or if audio output won't work (e.g., piped/redirected)
+if [[ ! -t 0 ]] || [[ ! -t 1 ]] || [[ "${CLAUDE_CODE:-}" == "1" ]] || [[ "${TERM_PROGRAM:-}" != "Apple_Terminal" && "${TERM_PROGRAM:-}" != "iTerm.app" ]]; then
+    # Launch in a NEW Terminal window so mic + speaker work
+    osascript -e "
+        tell application \"Terminal\"
+            activate
+            do script \"python3 $SCRIPT_DIR/voice_loop.py --persona $PERSONA $EXTRA_ARGS\"
+        end tell
+    " 2>/dev/null
+    echo "Voice mode launched in Terminal window."
+    exit 0
+fi
+
+# Normal terminal — run inline
+exec python3 "$SCRIPT_DIR/voice_loop.py" --persona "$PERSONA" $EXTRA_ARGS
